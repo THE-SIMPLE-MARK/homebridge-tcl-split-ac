@@ -29,10 +29,11 @@ Run Homebridge with `-D` to enable debug logging.
 
 The primary service is HomeKit's **Thermostat** service with one target
 temperature setpoint. Its target heating/cooling state controls power and
-selects Auto/Heat/Cool for the TCL operating mode. Fan speed is exposed as a
-separate Fan service with discrete TCL speed mapping. TCL Dry and Fan-only
-modes use a safe supported-mode fallback rather than being falsely presented
-as Cool. Commands are serialized and reconciled with fresh device state;
+selects Auto/Heat/Cool for the TCL operating mode. Fan power is exposed as a
+separate Fan service, while discrete fan speeds are selectable through the
+linked Fan Speed input selector (Auto, Silent, Low, Medium, Medium-High, and
+High). TCL Dry and Fan-only modes use a safe supported-mode fallback rather
+than being falsely presented as Cool. Commands are serialized and reconciled with fresh device state;
 offline reads use the last known state where possible, and polling and command
 refreshes are cleaned up on shutdown.
 

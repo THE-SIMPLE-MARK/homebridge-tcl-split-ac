@@ -15,6 +15,8 @@ export class TclAirConditioner {
   private readonly hap: any;
   private thermostat: any;
   private fanSvc: any;
+  private fanSelector: any;
+  private fanInputs = new Map<number, any>();
   private pollTimer?: ReturnType<typeof setInterval>;
   private staleTimer?: ReturnType<typeof setInterval>;
   private lastMode?: number;
@@ -97,9 +99,34 @@ export class TclAirConditioner {
     this.fanSvc = this.accessory.getService('Fan Speed Control')
       || this.accessory.addService(this.hap.Service.Fan, 'Fan Speed Control', 'fanSpeedControl');
     this.fanSvc.getCharacteristic(C.On).onGet(() => this.getActive()).onSet((v: boolean) => this.setFanActive(v));
-    this.fanSvc.getCharacteristic(C.RotationSpeed)
-      .setProps({ minValue: 0, maxValue: 100, minStep: 12.5 })
-      .onGet(() => this.getFanSpeed()).onSet((v: number) => this.setFanSpeed(v));
+
+    this.fanSelector = this.accessory.getService('Fan Speed Selector')
+      || this.accessory.addService(this.hap.Service.Television, 'Fan Speed Selector', 'fanSpeedSelector');
+    this.fanSelector.setCharacteristic(C.ConfiguredName, 'Fan Speed');
+    this.fanSelector.getCharacteristic(C.ActiveIdentifier)
+      .onGet(() => this.getFanModeIdentifier())
+      .onSet((v: number) => this.setFanModeIdentifier(v));
+
+    for (const mode of this.fanModeDefinitions()) {
+      const input = this.accessory.getService(mode.name)
+        || this.accessory.addService(this.hap.Service.InputSource, mode.name, `fanMode-${mode.id}`);
+      input.setCharacteristic(C.Identifier, mode.id)
+        .setCharacteristic(C.ConfiguredName, mode.name)
+        .setCharacteristic(C.InputSourceType, C.InputSourceType.OTHER);
+      this.fanSelector.addLinkedService(input);
+      this.fanInputs.set(mode.id, input);
+    }
+  }
+
+  private fanModeDefinitions(): Array<{ id: number; name: string; wind: number }> {
+    return [
+      { id: 1, name: 'Auto', wind: WIND.AUTO },
+      { id: 2, name: 'Silent', wind: WIND.SILENT },
+      { id: 3, name: 'Low', wind: WIND.MED_LOW },
+      { id: 4, name: 'Medium', wind: WIND.MED },
+      { id: 5, name: 'Medium-High', wind: WIND.MED_HIGH },
+      { id: 6, name: 'High', wind: WIND.HIGH },
+    ];
   }
 
   private async state(ctx: string): Promise<DeviceState> {
@@ -194,12 +221,15 @@ export class TclAirConditioner {
       return this.lastKnownTarget ?? 22;
     }
   }
-  private async getFanSpeed(): Promise<number> {
+  private async getFanModeIdentifier(): Promise<number> {
     try {
-      const s = await this.state('getFanSpeed');
-      return s.powerSwitch ? this.windToPercent(s.windSpeed) :
-        this.windToPercent(this.requestedWindSpeed ?? this.lastWindSpeed ?? s.windSpeed);
-    } catch (_) { return this.windToPercent(this.requestedWindSpeed ?? this.lastWindSpeed ?? WIND.AUTO); }
+      const s = await this.state('getFanModeIdentifier');
+      return this.windToIdentifier(s.powerSwitch
+        ? s.windSpeed
+        : this.requestedWindSpeed ?? this.lastWindSpeed ?? s.windSpeed);
+    } catch (_) {
+      return this.windToIdentifier(this.requestedWindSpeed ?? this.lastWindSpeed ?? WIND.AUTO);
+    }
   }
 
   private queueCommand(props: Props | (() => Props | Promise<Props>), ctx: string, keyProps?: Props): Promise<void> {
@@ -304,19 +334,23 @@ export class TclAirConditioner {
       }
     } catch (e) { throw this.hapError('setFanActive', e); }
   }
-  private async setFanSpeed(value: number): Promise<void> {
+  private async setFanModeIdentifier(identifier: number): Promise<void> {
+    const mode = this.fanModeDefinitions().find((entry) => entry.id === identifier);
+    if (!mode) throw this.hapError('setFanModeIdentifier', new Error(`Unknown fan mode identifier: ${identifier}`));
     try {
-      const wind = this.percentToWind(value);
-      const cur = await this.commandState('setFanSpeed');
+      const cur = await this.commandState('setFanModeIdentifier');
       if (cur.powerSwitch) {
-        await this.queueCommand({ windSpeed: wind }, 'setFanSpeed');
-        this.lastWindSpeed = wind;
+        await this.queueCommand({ windSpeed: mode.wind }, 'setFanModeIdentifier', { windSpeed: mode.wind });
+        this.lastWindSpeed = mode.wind;
         this.requestedWindSpeed = undefined;
       } else {
-        this.requestedWindSpeed = wind;
+        this.requestedWindSpeed = mode.wind;
       }
       this.fanSpeedSelected = true;
-    } catch (e) { throw this.hapError('setFanSpeed', e); }
+      this.fanSelector.updateCharacteristic(this.hap.Characteristic.ActiveIdentifier, identifier);
+    } catch (e) {
+      throw this.hapError('setFanModeIdentifier', e);
+    }
   }
 
   private modeProps(mode: number, cur: DeviceState): Props {
@@ -374,9 +408,12 @@ export class TclAirConditioner {
     this.thermostat.updateCharacteristic(C.TargetHeatingCoolingState,
       reconciled.powerSwitch ? this.workModeToHk(reconciled.workMode) : C.TargetHeatingCoolingState.OFF);
     this.fanSvc.updateCharacteristic(C.On, !!reconciled.powerSwitch);
-    this.fanSvc.updateCharacteristic(C.RotationSpeed,
-      reconciled.powerSwitch ? this.windToPercent(reconciled.windSpeed) :
-        this.windToPercent(this.requestedWindSpeed ?? this.lastWindSpeed ?? reconciled.windSpeed));
+    this.fanSelector.updateCharacteristic(
+      C.ActiveIdentifier,
+      this.windToIdentifier(reconciled.powerSwitch
+        ? reconciled.windSpeed
+        : this.requestedWindSpeed ?? this.lastWindSpeed ?? reconciled.windSpeed),
+    );
   }
   private rememberOptimisticProps(props: Props): void {
     for (const key of ['powerSwitch', 'workMode', 'windSpeed'] as const) {
@@ -389,16 +426,8 @@ export class TclAirConditioner {
     const C = this.hap.Characteristic;
     this.thermostat.updateCharacteristic(C.TargetTemperature, temp);
   }
-  private windToPercent(wind: number): number {
-    return ({ [WIND.AUTO]: 0, [WIND.SILENT]: 12.5, [WIND.MED_LOW]: 37.5, [WIND.MED]: 50, [WIND.MED_HIGH]: 62.5, [WIND.HIGH]: 87.5 } as Record<number, number>)[wind] ?? 0;
-  }
-  private percentToWind(value: number): number {
-    if (value <= 0) return WIND.AUTO;
-    if (value <= 25) return WIND.SILENT;
-    if (value <= 37.5) return WIND.MED_LOW;
-    if (value <= 50) return WIND.MED;
-    if (value <= 62.5) return WIND.MED_HIGH;
-    return WIND.HIGH;
+  private windToIdentifier(wind: number): number {
+    return this.fanModeDefinitions().find((mode) => mode.wind === wind)?.id ?? 1;
   }
 
   private startPolling(): void {
