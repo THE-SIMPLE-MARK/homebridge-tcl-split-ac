@@ -13,7 +13,7 @@ export class TclAirConditioner {
   private readonly log: Logging;
   private readonly api: any;
   private readonly hap: any;
-  private heaterCooler: any;
+  private thermostat: any;
   private fanSvc: any;
   private pollTimer?: ReturnType<typeof setInterval>;
   private staleTimer?: ReturnType<typeof setInterval>;
@@ -48,11 +48,11 @@ export class TclAirConditioner {
     this.api = platform.tclApi;
     this.hap = platform.api.hap;
     this.setupAccessoryInfo();
-    this.setupHeaterCooler();
-    this.removeLegacyThermostats();
+    this.setupThermostat();
+    this.removeLegacyFanServices();
     this.setupFan();
     this.startPolling();
-    this.log.info(`${device.deviceName} ready (Heater-Cooler | 16-31C | 8 fan speeds)`);
+    this.log.info(`${device.deviceName} ready (Thermostat | 16-31C | 8 fan speeds)`);
   }
 
   stop(): void {
@@ -71,39 +71,29 @@ export class TclAirConditioner {
       .setCharacteristic(this.hap.Characteristic.FirmwareRevision, this.device.firmwareVersion || '1.0.0');
   }
 
-  private setupHeaterCooler(): void {
+  private setupThermostat(): void {
     const C = this.hap.Characteristic;
-    this.heaterCooler = this.accessory.getService(this.hap.Service.HeaterCooler)
-      || this.accessory.addService(this.hap.Service.HeaterCooler, this.device.deviceName, 'heaterCooler');
-    this.heaterCooler.setCharacteristic(C.Name, this.device.deviceName);
-    this.heaterCooler.getCharacteristic(C.Active)
-      .onGet(() => this.getActive())
-      .onSet((v: number) => this.setActive(v));
-    this.heaterCooler.getCharacteristic(C.CurrentHeaterCoolerState)
+    this.thermostat = this.accessory.getService(this.hap.Service.Thermostat)
+      || this.accessory.addService(this.hap.Service.Thermostat, this.device.deviceName, 'thermostat');
+    this.thermostat.setCharacteristic(C.Name, this.device.deviceName);
+    this.thermostat.getCharacteristic(C.CurrentHeatingCoolingState)
       .onGet(() => this.getCurrentState());
-    this.heaterCooler.getCharacteristic(C.TargetHeaterCoolerState)
-      .setProps({ validValues: [C.TargetHeaterCoolerState.AUTO, C.TargetHeaterCoolerState.HEAT, C.TargetHeaterCoolerState.COOL] })
+    this.thermostat.getCharacteristic(C.TargetHeatingCoolingState)
+      .setProps({ validValues: [C.TargetHeatingCoolingState.OFF, C.TargetHeatingCoolingState.AUTO, C.TargetHeatingCoolingState.HEAT, C.TargetHeatingCoolingState.COOL] })
       .onGet(() => this.getTargetMode())
       .onSet((v: number) => this.setTargetMode(v));
-    this.heaterCooler.getCharacteristic(C.CurrentTemperature)
+    this.thermostat.getCharacteristic(C.CurrentTemperature)
       .setProps({ minValue: -50, maxValue: 100, minStep: 0.1 })
       .onGet(() => this.getCurrentTemp());
-    for (const characteristic of [C.HeatingThresholdTemperature, C.CoolingThresholdTemperature]) {
-      this.heaterCooler.getCharacteristic(characteristic)
-        .setProps({ minValue: 16, maxValue: 31, minStep: 1 })
-        .onGet(() => this.getTargetTemp())
-        .onSet((v: number) => this.setTargetTemp(v));
-    }
-    this.heaterCooler.getCharacteristic(C.TemperatureDisplayUnits)
+    this.thermostat.getCharacteristic(C.TargetTemperature)
+      .setProps({ minValue: 16, maxValue: 31, minStep: 1 })
+      .onGet(() => this.getTargetTemp())
+      .onSet((v: number) => this.setTargetTemp(v));
+    this.thermostat.getCharacteristic(C.TemperatureDisplayUnits)
       .onGet(() => C.TemperatureDisplayUnits.CELSIUS);
   }
 
-  private removeLegacyThermostats(): void {
-    const legacy = this.accessory.getService(this.hap.Service.Thermostat);
-    if (legacy) {
-      this.accessory.removeService(legacy);
-      this.log.info(`${this.device.deviceName}: removed legacy Thermostat service`);
-    }
+  private removeLegacyFanServices(): void {
     for (const name of ['Sleep Mode', 'Fan Mode', 'Cool Fan Speed', 'AC Fan', 'Fan Speed']) {
       const service = this.accessory.getService(name);
       if (service) this.accessory.removeService(service);
@@ -172,27 +162,28 @@ export class TclAirConditioner {
   private async getCurrentState(): Promise<number> {
     try {
       const s = await this.state('getCurrentState');
-      if (!s.powerSwitch) return this.hap.Characteristic.CurrentHeaterCoolerState.INACTIVE;
-      if (s.workMode === MODE.HEAT) return this.hap.Characteristic.CurrentHeaterCoolerState.HEATING;
-      if (s.workMode === MODE.COOL) return this.hap.Characteristic.CurrentHeaterCoolerState.COOLING;
-      if (s.workMode === MODE.AUTO) return this.hap.Characteristic.CurrentHeaterCoolerState.IDLE;
-      this.log.warn(`${this.device.deviceName}: unsupported TCL mode ${s.workMode}; reporting IDLE`);
-      return this.hap.Characteristic.CurrentHeaterCoolerState.IDLE;
-    } catch (_) { return this.hap.Characteristic.CurrentHeaterCoolerState.INACTIVE; }
+      if (!s.powerSwitch) return this.hap.Characteristic.CurrentHeatingCoolingState.OFF;
+      if (s.workMode === MODE.HEAT) return this.hap.Characteristic.CurrentHeatingCoolingState.HEAT;
+      if (s.workMode === MODE.COOL) return this.hap.Characteristic.CurrentHeatingCoolingState.COOL;
+      if (s.workMode === MODE.AUTO) return this.hap.Characteristic.CurrentHeatingCoolingState.COOL;
+      this.log.warn(`${this.device.deviceName}: unsupported TCL mode ${s.workMode}; reporting OFF`);
+      return this.hap.Characteristic.CurrentHeatingCoolingState.OFF;
+    } catch (_) { return this.hap.Characteristic.CurrentHeatingCoolingState.OFF; }
   }
   private async getTargetMode(): Promise<number> {
     try {
       const s = await this.state('getTargetMode');
       if (!s.isOnline) {
+        if (this.lastPowerSwitch === 0) return this.hap.Characteristic.TargetHeatingCoolingState.OFF;
         if (this.lastSupportedTargetMode !== undefined) return this.lastSupportedTargetMode;
         if (this.lastMode !== undefined) return this.workModeToHk(this.lastMode);
-        return this.hap.Characteristic.TargetHeaterCoolerState.AUTO;
+        return this.hap.Characteristic.TargetHeatingCoolingState.OFF;
       }
-      return this.workModeToHk(s.workMode);
+      return s.powerSwitch ? this.workModeToHk(s.workMode) : this.hap.Characteristic.TargetHeatingCoolingState.OFF;
     }
     catch (_) {
       this.log.warn(`${this.device.deviceName}: target mode unavailable; retaining last supported target mode`);
-      return this.lastSupportedTargetMode ?? this.hap.Characteristic.TargetHeaterCoolerState.AUTO;
+      return this.lastSupportedTargetMode ?? this.hap.Characteristic.TargetHeatingCoolingState.OFF;
     }
   }
   private async getCurrentTemp(): Promise<number> {
@@ -269,6 +260,11 @@ export class TclAirConditioner {
   private async setTargetMode(value: number): Promise<void> {
     try {
       const cur = await this.commandState('setTargetMode');
+      const C = this.hap.Characteristic.TargetHeatingCoolingState;
+      if (value === C.OFF) {
+        await this.queueCommand({ powerSwitch: 0 }, 'setTargetMode', { powerSwitch: 0 });
+        return;
+      }
       const mode = this.hkToWorkMode(value);
       await this.queueCommand(async () => {
         const latest = await this.commandState('setTargetMode latest');
@@ -299,7 +295,7 @@ export class TclAirConditioner {
           powerSwitch: cur.powerSwitch, workMode: cur.workMode, windSpeed, ...target,
         });
       }
-      this.updateThresholds(temp);
+      this.updateTargetTemperature(temp);
     } catch (e) { throw this.hapError('setTargetTemp', e); }
   }
   private async setFanActive(value: boolean): Promise<void> {
@@ -333,7 +329,7 @@ export class TclAirConditioner {
 
   private modeProps(mode: number, cur: DeviceState): Props {
     if (![MODE.AUTO, MODE.COOL, MODE.HEAT].includes(mode as 0 | 1 | 4)) {
-      this.log.warn(`${this.device.deviceName}: unsupported TCL mode ${mode}; retaining last supported target mode`);
+      this.log.warn(`${this.device.deviceName}: unsupported TCL mode ${mode}; retaining AUTO fallback`);
       mode = this.lastSupportedTargetMode === undefined ? MODE.AUTO : this.hkToWorkMode(this.lastSupportedTargetMode);
     }
     const windSpeed = cur.powerSwitch ? cur.windSpeed :
@@ -343,16 +339,16 @@ export class TclAirConditioner {
       ECO: 0, sleep: 0, turbo: 0, silenceSwitch: 0 };
   }
   private hkToWorkMode(value: number): number {
-    const C = this.hap.Characteristic.TargetHeaterCoolerState;
+    const C = this.hap.Characteristic.TargetHeatingCoolingState;
     return value === C.HEAT ? MODE.HEAT : value === C.AUTO ? MODE.AUTO : MODE.COOL;
   }
   private workModeToHk(mode: number): number {
-    const C = this.hap.Characteristic.TargetHeaterCoolerState;
+    const C = this.hap.Characteristic.TargetHeatingCoolingState;
     if (mode === MODE.HEAT) { this.lastSupportedTargetMode = C.HEAT; return C.HEAT; }
     if (mode === MODE.AUTO) { this.lastSupportedTargetMode = C.AUTO; return C.AUTO; }
     if (mode === MODE.COOL) { this.lastSupportedTargetMode = C.COOL; return C.COOL; }
-    this.log.warn(`${this.device.deviceName}: unsupported TCL mode ${mode}; retaining last supported target mode`);
-    return this.lastSupportedTargetMode ?? C.AUTO;
+    this.log.warn(`${this.device.deviceName}: unsupported TCL mode ${mode}; reporting AUTO`);
+    return C.AUTO;
   }
   private hapError(ctx: string, error: unknown): Error {
     this.log.error(`${ctx}: ${errMsg(error)}`);
@@ -378,13 +374,14 @@ export class TclAirConditioner {
     this.lastKnownTarget = reconciled.targetTemperature;
     if (reconciled.currentTemperature !== undefined) this.lastKnownTemp = reconciled.currentTemperature;
     const C = this.hap.Characteristic;
-    if (this.lastKnownTemp !== undefined) this.heaterCooler.updateCharacteristic(C.CurrentTemperature, this.lastKnownTemp);
-    if (reconciled.targetTemperature !== undefined) this.updateThresholds(reconciled.targetTemperature);
-    this.heaterCooler.updateCharacteristic(C.Active, reconciled.powerSwitch ? 1 : 0);
-    this.heaterCooler.updateCharacteristic(C.CurrentHeaterCoolerState, !reconciled.powerSwitch ? C.CurrentHeaterCoolerState.INACTIVE :
-      reconciled.workMode === MODE.HEAT ? C.CurrentHeaterCoolerState.HEATING :
-      reconciled.workMode === MODE.COOL ? C.CurrentHeaterCoolerState.COOLING : C.CurrentHeaterCoolerState.IDLE);
-    this.heaterCooler.updateCharacteristic(C.TargetHeaterCoolerState, this.workModeToHk(reconciled.workMode));
+    if (this.lastKnownTemp !== undefined) this.thermostat.updateCharacteristic(C.CurrentTemperature, this.lastKnownTemp);
+    if (reconciled.targetTemperature !== undefined) this.updateTargetTemperature(reconciled.targetTemperature);
+    this.thermostat.updateCharacteristic(C.CurrentHeatingCoolingState, !reconciled.powerSwitch ? C.CurrentHeatingCoolingState.OFF :
+      reconciled.workMode === MODE.HEAT ? C.CurrentHeatingCoolingState.HEAT :
+      reconciled.workMode === MODE.COOL || reconciled.workMode === MODE.AUTO ? C.CurrentHeatingCoolingState.COOL :
+      C.CurrentHeatingCoolingState.OFF);
+    this.thermostat.updateCharacteristic(C.TargetHeatingCoolingState,
+      reconciled.powerSwitch ? this.workModeToHk(reconciled.workMode) : C.TargetHeatingCoolingState.OFF);
     this.fanSvc.updateCharacteristic(C.On, !!reconciled.powerSwitch);
     this.fanSvc.updateCharacteristic(C.RotationSpeed,
       reconciled.powerSwitch ? this.windToPercent(reconciled.windSpeed) :
@@ -397,10 +394,9 @@ export class TclAirConditioner {
     const target = props.targetCelsiusDegree ?? props.targetTemperature;
     if (typeof target === 'number') this.optimisticState.targetTemperature = target;
   }
-  private updateThresholds(temp: number): void {
+  private updateTargetTemperature(temp: number): void {
     const C = this.hap.Characteristic;
-    this.heaterCooler.updateCharacteristic(C.HeatingThresholdTemperature, temp);
-    this.heaterCooler.updateCharacteristic(C.CoolingThresholdTemperature, temp);
+    this.thermostat.updateCharacteristic(C.TargetTemperature, temp);
   }
   private windToPercent(wind: number): number {
     return ({ [WIND.AUTO]: 0, [WIND.SILENT]: 12.5, [WIND.MED_LOW]: 37.5, [WIND.MED]: 50, [WIND.MED_HIGH]: 62.5, [WIND.HIGH]: 87.5 } as Record<number, number>)[wind] ?? 0;

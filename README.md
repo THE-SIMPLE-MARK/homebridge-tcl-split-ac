@@ -27,12 +27,14 @@ Homebridge plugin for TCL inverter split ACs. Tested on the **TCL TAC-09CHSD/XA4
 
 Run Homebridge with `-D` to enable debug logging.
 
-The primary service is HomeKit's **Heater-Cooler** service. Its Active
-characteristic controls power, while Auto/Heat/Cool select the TCL operating
-mode. Heating and cooling threshold temperatures are intentionally kept at the
-same value because the appliance has one setpoint. Fan speed is exposed as a
-separate Fan service. TCL Dry and Fan-only modes are reported as unsupported
-idle states rather than being presented as a different HomeKit mode.
+The primary service is HomeKit's **Thermostat** service with one target
+temperature setpoint. Its target heating/cooling state controls power and
+selects Auto/Heat/Cool for the TCL operating mode. Fan speed is exposed as a
+separate Fan service with discrete TCL speed mapping. TCL Dry and Fan-only
+modes use a safe supported-mode fallback rather than being falsely presented
+as Cool. Commands are serialized and reconciled with fresh device state;
+offline reads use the last known state where possible, and polling and command
+refreshes are cleaned up on shutdown.
 
 ## License
 
