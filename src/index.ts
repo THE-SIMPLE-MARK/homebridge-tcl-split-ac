@@ -1,5 +1,5 @@
 import { TclHomePlatform } from './platform.js';
 
 export default (homebridge: any): void => {
-  homebridge.registerPlatform('homebridge-tcl-split-ac', 'TclHome', TclHomePlatform);
+  homebridge.registerPlatform('@the-simple-mark/homebridge-tcl-split-ac', 'TclHome', TclHomePlatform);
 };

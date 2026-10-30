@@ -91,7 +91,7 @@ export class TclHomePlatform {
     } else {
       const acc = new this.api.platformAccessory(device.deviceName, uuid) as PlatformAccessory;
       this.controllers.set(uuid, new TclAirConditioner(this, acc, device));
-      this.api.registerPlatformAccessories('homebridge-tcl-split-ac', 'TclHome', [acc]);
+      this.api.registerPlatformAccessories('@the-simple-mark/homebridge-tcl-split-ac', 'TclHome', [acc]);
       this.accessories.push(acc);
     }
   }
