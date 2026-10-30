@@ -1,4 +1,4 @@
-import { API, Logging, PlatformAccessory } from 'homebridge';
+import { API, Logging, PlatformAccessory, PlatformConfig } from 'homebridge';
 import { TclHomeApi } from './api.js';
 import { TclAirConditioner } from './accessory.js';
 import { errMsg } from './utils.js';
@@ -6,7 +6,7 @@ import { TclDevice } from './types.js';
 
 export class TclHomePlatform {
   public log:         Logging;
-  public config:      Record<string, unknown>;
+  public config:      PlatformConfig;
   public api:         API;
   public accessories: PlatformAccessory[] = [];
   public tclApi!:     TclHomeApi;
@@ -17,7 +17,7 @@ export class TclHomePlatform {
   private readonly shutdownListener = () => this.shutdown();
   private stopped = false;
 
-  constructor(log: Logging, config: Record<string, unknown>, api: API) {
+  constructor(log: Logging, config: PlatformConfig, api: API) {
     this.log    = log;
     this.config = config;
     this.api    = api;
@@ -106,7 +106,10 @@ export class TclHomePlatform {
     if (this.credentialTimer) clearInterval(this.credentialTimer);
     for (const controller of this.controllers.values()) controller.stop();
     this.controllers.clear();
-    (this.api as any).removeListener?.('didFinishLaunching', this.didFinishLaunchingListener);
-    (this.api as any).removeListener?.('shutdown', this.shutdownListener);
+    const removableApi = this.api as API & {
+      removeListener?: (event: 'didFinishLaunching' | 'shutdown', listener: () => void) => API;
+    };
+    removableApi.removeListener?.('didFinishLaunching', this.didFinishLaunchingListener);
+    removableApi.removeListener?.('shutdown', this.shutdownListener);
   }
 }

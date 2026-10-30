@@ -165,7 +165,7 @@ export class TclHomeApi {
       sessionToken:    creds.SessionToken,
       region,
       maxRetries:      0,
-      httpOptions:     { timeout: 5000, connectTimeout: 3000, agent: keepAliveAgent as any },
+      httpOptions:     { timeout: 5000, connectTimeout: 3000, agent: keepAliveAgent },
     });
     this.log.info('AWS IoT ready');
   }
@@ -303,9 +303,8 @@ export class TclHomeApi {
         // let an older optimistic write overwrite that newer reported state.
         if (current && current === cached && current.lastUpdated === cachedTimestamp) {
           Object.assign(current, props);
-          const p = props as any;
-          if (p.targetCelsiusDegree !== undefined)
-            current.targetTemperature = p.targetCelsiusDegree;
+          const target = props.targetCelsiusDegree;
+          if (typeof target === 'number') current.targetTemperature = target;
         }
 
         this.log.debug(`Command sent (attempt ${attempt})`);

@@ -1,19 +1,20 @@
-import { Logging } from 'homebridge';
+import { HAP, Logging, PlatformAccessory, Service } from 'homebridge';
 import { TclHomePlatform } from './platform.js';
 import { MODE, TIMEOUTS } from './constants.js';
 import { DeviceState, TclDevice } from './types.js';
+import { TclHomeApi } from './api.js';
 import { errMsg, withTimeout } from './utils.js';
 
 type Props = Record<string, unknown>;
 
 export class TclAirConditioner {
   private readonly platform: TclHomePlatform;
-  private readonly accessory: any;
+  private readonly accessory: PlatformAccessory;
   private readonly device: TclDevice;
   private readonly log: Logging;
-  private readonly api: any;
-  private readonly hap: any;
-  private thermostat: any;
+  private readonly api: TclHomeApi;
+  private readonly hap: HAP;
+  private thermostat!: Service;
   private pollTimer?: ReturnType<typeof setInterval>;
   private staleTimer?: ReturnType<typeof setInterval>;
   private lastMode?: number;
@@ -36,7 +37,7 @@ export class TclAirConditioner {
   private pollInFlight?: Promise<void>;
   private stopped = false;
 
-  constructor(platform: TclHomePlatform, accessory: any, device: TclDevice) {
+  constructor(platform: TclHomePlatform, accessory: PlatformAccessory, device: TclDevice) {
     this.platform = platform;
     this.accessory = accessory;
     this.device = device;
@@ -58,7 +59,8 @@ export class TclAirConditioner {
   }
 
   private setupAccessoryInfo(): void {
-    const info = this.accessory.getService(this.hap.Service.AccessoryInformation);
+    const info = this.accessory.getService(this.hap.Service.AccessoryInformation)
+      ?? this.accessory.addService(this.hap.Service.AccessoryInformation, this.device.deviceName);
     info.setCharacteristic(this.hap.Characteristic.Manufacturer, 'TCL')
       .setCharacteristic(this.hap.Characteristic.Model, 'TAC-09CHSD/XA41IN')
       .setCharacteristic(this.hap.Characteristic.SerialNumber, this.device.deviceId)
@@ -75,14 +77,14 @@ export class TclAirConditioner {
     this.thermostat.getCharacteristic(C.TargetHeatingCoolingState)
       .setProps({ validValues: [C.TargetHeatingCoolingState.OFF, C.TargetHeatingCoolingState.AUTO, C.TargetHeatingCoolingState.HEAT, C.TargetHeatingCoolingState.COOL] })
       .onGet(() => this.getTargetMode())
-      .onSet((v: number) => this.setTargetMode(v));
+      .onSet((v) => this.setTargetMode(Number(v)));
     this.thermostat.getCharacteristic(C.CurrentTemperature)
       .setProps({ minValue: -50, maxValue: 100, minStep: 0.1 })
       .onGet(() => this.getCurrentTemp());
     this.thermostat.getCharacteristic(C.TargetTemperature)
       .setProps({ minValue: 16, maxValue: 31, minStep: 1 })
       .onGet(() => this.getTargetTemp())
-      .onSet((v: number) => this.setTargetTemp(v));
+      .onSet((v) => this.setTargetTemp(Number(v)));
     this.thermostat.getCharacteristic(C.TemperatureDisplayUnits)
       .onGet(() => C.TemperatureDisplayUnits.CELSIUS);
   }
