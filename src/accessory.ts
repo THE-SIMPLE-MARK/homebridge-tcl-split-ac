@@ -49,7 +49,6 @@ export class TclAirConditioner {
     this.hap = platform.api.hap;
     this.setupAccessoryInfo();
     this.setupThermostat();
-    this.removeLegacyFanServices();
     this.setupFan();
     this.startPolling();
     this.log.info(`${device.deviceName} ready (Thermostat | 16-31C | 8 fan speeds)`);
@@ -91,13 +90,6 @@ export class TclAirConditioner {
       .onSet((v: number) => this.setTargetTemp(v));
     this.thermostat.getCharacteristic(C.TemperatureDisplayUnits)
       .onGet(() => C.TemperatureDisplayUnits.CELSIUS);
-  }
-
-  private removeLegacyFanServices(): void {
-    for (const name of ['Sleep Mode', 'Fan Mode', 'Cool Fan Speed', 'AC Fan', 'Fan Speed']) {
-      const service = this.accessory.getService(name);
-      if (service) this.accessory.removeService(service);
-    }
   }
 
   private setupFan(): void {
