@@ -1,449 +1,450 @@
 import { Logging } from 'homebridge';
 import { TclHomePlatform } from './platform.js';
 import { MODE, TIMEOUTS, WIND } from './constants.js';
-import { DeviceState, TclDevice } from './types.js';
+import { DeviceState } from './types.js';
 import { errMsg, withTimeout } from './utils.js';
 
-type Props = Record<string, unknown>;
-
 export class TclAirConditioner {
-  private readonly platform: TclHomePlatform;
-  private readonly accessory: any;
-  private readonly device: TclDevice;
-  private readonly log: Logging;
-  private readonly api: any;
-  private readonly hap: any;
-  private heaterCooler: any;
-  private fanSvc: any;
-  private pollTimer?: ReturnType<typeof setInterval>;
-  private staleTimer?: ReturnType<typeof setInterval>;
-  private lastMode?: number;
-  private lastWindSpeed?: number;
-  private requestedWindSpeed?: number;
-  private lastPowerSwitch?: number;
-  private lastKnownTarget?: number;
-  private lastSupportedTargetMode?: number;
-  private fanSpeedSelected = false;
-  private minTemp = 16;
-  private maxTemp = 31;
-  private lastKnownTemp?: number;
-  private lastStateKey = '';
-  private errCount = 0;
-  private lastOkPoll = Date.now();
-  private commandQueue: Promise<void> = Promise.resolve();
-  private lastCommandKey: string | null = null;
-  private lastCommandTime = 0;
-  private lastCommandPromise?: Promise<void>;
-  private commandGeneration = 0;
-  private optimisticState: Partial<DeviceState> = {};
-  private lastAppliedStateTime = 0;
-  private pollInFlight?: Promise<void>;
-  private stopped = false;
+  private platform:  TclHomePlatform;
+  private accessory: any;
+  private device:    any;
+  private log:       Logging;
+  private api:       any;
+  private hap:       any;
 
-  constructor(platform: TclHomePlatform, accessory: any, device: TclDevice) {
-    this.platform = platform;
+  private thermo:   any;
+  private fanSvc:   any;
+
+  private _lastMode:       number;
+  private _lastWindSpeed:  number;
+  private _minTemp:        number = 16;
+  private _maxTemp:        number = 31;
+  private _errCount:       number = 0;
+  private _lastOkPoll:     number;
+  private _lastStateKey:   string = '';
+  private _lastKnownTemp:  number | undefined;
+
+  // Serial command queue — prevents parallel publishes from racing.
+  private commandQueue:     Promise<any>  = Promise.resolve();
+  private _lastCommandKey:  string | null = null;
+  private _lastCommandTime: number        = 0;
+
+  constructor(platform: TclHomePlatform, accessory: any, device: any) {
+    this.platform  = platform;
     this.accessory = accessory;
-    this.device = device;
-    this.log = platform.log;
-    this.api = platform.tclApi;
-    this.hap = platform.api.hap;
-    this.setupAccessoryInfo();
-    this.setupHeaterCooler();
-    this.removeLegacyThermostats();
-    this.setupFan();
-    this.startPolling();
-    this.log.info(`${device.deviceName} ready (Heater-Cooler | 16-31C | 8 fan speeds)`);
-  }
+    this.device    = device;
+    this.log       = platform.log;
+    this.api       = platform.tclApi;
+    this.hap       = platform.api.hap;
 
-  stop(): void {
-    this.stopped = true;
-    if (this.pollTimer) clearInterval(this.pollTimer);
-    if (this.staleTimer) clearInterval(this.staleTimer);
-    this.pollTimer = undefined;
-    this.staleTimer = undefined;
+    this._lastMode      = MODE.COOL;
+    this._lastWindSpeed = WIND.AUTO;
+    this._lastOkPoll    = Date.now();
+
+    this.setupAccessoryInfo();
+    this.setupThermostat();
+    this.removeLegacyServices();
+    this.setupFanSpeedControl();
+    this.startPolling();
+
+    this.log.info(`${device.deviceName} ready (TAC-09CHSD/XA41IN | Cool/Heat/Auto | 16-31C | 8 fan speeds)`);
   }
 
   private setupAccessoryInfo(): void {
-    const info = this.accessory.getService(this.hap.Service.AccessoryInformation);
-    info.setCharacteristic(this.hap.Characteristic.Manufacturer, 'TCL')
+    this.accessory
+      .getService(this.hap.Service.AccessoryInformation)
+      .setCharacteristic(this.hap.Characteristic.Manufacturer, 'TCL')
       .setCharacteristic(this.hap.Characteristic.Model, 'TAC-09CHSD/XA41IN')
       .setCharacteristic(this.hap.Characteristic.SerialNumber, this.device.deviceId)
       .setCharacteristic(this.hap.Characteristic.FirmwareRevision, this.device.firmwareVersion || '1.0.0');
   }
 
-  private setupHeaterCooler(): void {
+  private setupThermostat(): void {
     const C = this.hap.Characteristic;
-    this.heaterCooler = this.accessory.getService(this.hap.Service.HeaterCooler)
-      || this.accessory.addService(this.hap.Service.HeaterCooler, this.device.deviceName, 'heaterCooler');
-    this.heaterCooler.setCharacteristic(C.Name, this.device.deviceName);
-    this.heaterCooler.getCharacteristic(C.Active)
-      .onGet(() => this.getActive())
-      .onSet((v: number) => this.setActive(v));
-    this.heaterCooler.getCharacteristic(C.CurrentHeaterCoolerState)
-      .onGet(() => this.getCurrentState());
-    this.heaterCooler.getCharacteristic(C.TargetHeaterCoolerState)
-      .setProps({ validValues: [C.TargetHeaterCoolerState.AUTO, C.TargetHeaterCoolerState.HEAT, C.TargetHeaterCoolerState.COOL] })
-      .onGet(() => this.getTargetMode())
-      .onSet((v: number) => this.setTargetMode(v));
-    this.heaterCooler.getCharacteristic(C.CurrentTemperature)
+    this.thermo = this.accessory.getService(this.hap.Service.Thermostat)
+               || this.accessory.addService(this.hap.Service.Thermostat);
+    this.thermo.setCharacteristic(C.Name, this.device.deviceName);
+
+    this.thermo.getCharacteristic(C.CurrentHeatingCoolingState)
+      .onGet(this.getCurrentMode.bind(this));
+
+    this.thermo.getCharacteristic(C.TargetHeatingCoolingState)
+      .setProps({ validValues: [
+        C.TargetHeatingCoolingState.OFF,
+        C.TargetHeatingCoolingState.COOL,
+        C.TargetHeatingCoolingState.HEAT,
+        C.TargetHeatingCoolingState.AUTO,
+      ]})
+      .onGet(this.getTargetMode.bind(this))
+      .onSet(this.setTargetMode.bind(this));
+
+    this.thermo.getCharacteristic(C.CurrentTemperature)
       .setProps({ minValue: -50, maxValue: 100, minStep: 0.1 })
-      .onGet(() => this.getCurrentTemp());
-    for (const characteristic of [C.HeatingThresholdTemperature, C.CoolingThresholdTemperature]) {
-      this.heaterCooler.getCharacteristic(characteristic)
-        .setProps({ minValue: 16, maxValue: 31, minStep: 1 })
-        .onGet(() => this.getTargetTemp())
-        .onSet((v: number) => this.setTargetTemp(v));
-    }
-    this.heaterCooler.getCharacteristic(C.TemperatureDisplayUnits)
+      .onGet(this.getCurrentTemp.bind(this));
+
+    this.thermo.getCharacteristic(C.TargetTemperature)
+      .setProps({ minValue: 16, maxValue: 31, minStep: 1 })
+      .onGet(this.getTargetTemp.bind(this))
+      .onSet(this.setTargetTemp.bind(this));
+
+    this.thermo.getCharacteristic(C.TemperatureDisplayUnits)
       .onGet(() => C.TemperatureDisplayUnits.CELSIUS);
   }
 
-  private removeLegacyThermostats(): void {
-    const legacy = this.accessory.getService(this.hap.Service.Thermostat);
-    if (legacy) {
-      this.accessory.removeService(legacy);
-      this.log.info(`${this.device.deviceName}: removed legacy Thermostat service`);
-    }
-    for (const name of ['Sleep Mode', 'Fan Mode', 'Cool Fan Speed', 'AC Fan', 'Fan Speed']) {
-      const service = this.accessory.getService(name);
-      if (service) this.accessory.removeService(service);
+  private removeLegacyServices(): void {
+    const names = ['Sleep Mode', 'Fan Speed', 'Fan Mode', 'Cool Fan Speed', 'AC Fan', 'Fan Speed Control'];
+    for (const name of names) {
+      const svc = this.accessory.getService(name);
+      if (svc) {
+        this.accessory.removeService(svc);
+        this.log.debug(`Removed legacy service: ${name}`);
+      }
     }
   }
 
-  private setupFan(): void {
+  private setupFanSpeedControl(): void {
     const C = this.hap.Characteristic;
     this.fanSvc = this.accessory.getService('Fan Speed Control')
-      || this.accessory.addService(this.hap.Service.Fan, 'Fan Speed Control', 'fanSpeedControl');
-    this.fanSvc.getCharacteristic(C.On).onGet(() => this.getActive()).onSet((v: boolean) => this.setFanActive(v));
+               || this.accessory.addService(this.hap.Service.Fan, 'Fan Speed Control', 'fanSpeedControl');
+
+    this.fanSvc.getCharacteristic(C.On)
+      .onGet(this.getFanActive.bind(this))
+      .onSet(this.setFanActive.bind(this));
+
     this.fanSvc.getCharacteristic(C.RotationSpeed)
       .setProps({ minValue: 0, maxValue: 100, minStep: 12.5 })
-      .onGet(() => this.getFanSpeed()).onSet((v: number) => this.setFanSpeed(v));
+      .onGet(this.getFanSpeed.bind(this))
+      .onSet(this.setFanSpeed.bind(this));
   }
 
-  private async state(ctx: string): Promise<DeviceState> {
-    const state = await withTimeout(this.api.getDeviceState(this.device.deviceId, false), TIMEOUTS.HOMEKIT_GET, ctx) as DeviceState;
-    this.rememberState(state);
-    return state;
-  }
+  // ---- Getters — read from cache; polling keeps it fresh ----
 
-  private rememberState(s: DeviceState): void {
-    if (!s.isOnline) return;
-    this.lastPowerSwitch = s.powerSwitch;
-    this.lastMode = s.workMode;
-    this.lastKnownTarget = s.targetTemperature;
-    if (this.lastWindSpeed === undefined || !this.fanSpeedSelected) {
-      this.lastWindSpeed = s.windSpeed;
-    }
-  }
-
-  private async commandState(ctx: string): Promise<DeviceState> {
-    const cached = this.api.stateCache[this.device.deviceId] as DeviceState | undefined;
-    let current = cached && cached.isOnline && Date.now() - cached.lastUpdated <= 45000 ? cached : undefined;
-    if (!current) {
-      const fresh = await withTimeout(
-        this.api.getDeviceState(this.device.deviceId, true), TIMEOUTS.HOMEKIT_GET, `${ctx} refresh`,
-      ) as DeviceState;
-      this.rememberState(fresh);
-      if (fresh.isOnline) current = fresh;
-    }
-    if (current) return current;
-
-    if (this.lastPowerSwitch !== undefined && this.lastMode !== undefined &&
-        this.lastWindSpeed !== undefined && this.lastKnownTarget !== undefined) {
-      this.log.warn(`${this.device.deviceName}: ${ctx} using last-known state while a fresh state is unavailable`);
-      return {
-        powerSwitch: this.lastPowerSwitch,
-        workMode: this.lastMode,
-        windSpeed: this.lastWindSpeed,
-        targetTemperature: this.lastKnownTarget,
-        currentTemperature: this.lastKnownTemp,
-        minTemp: this.minTemp,
-        maxTemp: this.maxTemp,
-        isOnline: false,
-        lastUpdated: Date.now(),
-      };
-    }
-    throw new Error(`${ctx}: device state unavailable`);
-  }
-
-  private async getActive(): Promise<number> {
-    try { return (await this.state('getActive')).powerSwitch ? 1 : 0; } catch (_) { return 0; }
-  }
-  private async getCurrentState(): Promise<number> {
+  async getCurrentMode(): Promise<number> {
     try {
-      const s = await this.state('getCurrentState');
-      if (!s.powerSwitch) return this.hap.Characteristic.CurrentHeaterCoolerState.INACTIVE;
-      if (s.workMode === MODE.HEAT) return this.hap.Characteristic.CurrentHeaterCoolerState.HEATING;
-      if (s.workMode === MODE.COOL) return this.hap.Characteristic.CurrentHeaterCoolerState.COOLING;
-      if (s.workMode === MODE.AUTO) return this.hap.Characteristic.CurrentHeaterCoolerState.IDLE;
-      this.log.warn(`${this.device.deviceName}: unsupported TCL mode ${s.workMode}; reporting IDLE`);
-      return this.hap.Characteristic.CurrentHeaterCoolerState.IDLE;
-    } catch (_) { return this.hap.Characteristic.CurrentHeaterCoolerState.INACTIVE; }
+      const s: DeviceState = await withTimeout(
+        this.api.getDeviceState(this.device.deviceId, false),
+        TIMEOUTS.HOMEKIT_GET, 'getCurrentMode',
+      );
+      if (!s.powerSwitch) return this.hap.Characteristic.CurrentHeatingCoolingState.OFF;
+      return s.workMode === MODE.HEAT
+        ? this.hap.Characteristic.CurrentHeatingCoolingState.HEAT
+        : this.hap.Characteristic.CurrentHeatingCoolingState.COOL;
+    } catch (_e) { return this.hap.Characteristic.CurrentHeatingCoolingState.OFF; }
   }
-  private async getTargetMode(): Promise<number> {
+
+  async getTargetMode(): Promise<number> {
     try {
-      const s = await this.state('getTargetMode');
-      if (!s.isOnline) {
-        if (this.lastSupportedTargetMode !== undefined) return this.lastSupportedTargetMode;
-        if (this.lastMode !== undefined) return this.workModeToHk(this.lastMode);
-        return this.hap.Characteristic.TargetHeaterCoolerState.AUTO;
-      }
+      const s: DeviceState = await withTimeout(
+        this.api.getDeviceState(this.device.deviceId, false),
+        TIMEOUTS.HOMEKIT_GET, 'getTargetMode',
+      );
+      if (!s.powerSwitch) return this.hap.Characteristic.TargetHeatingCoolingState.OFF;
       return this.workModeToHk(s.workMode);
-    }
-    catch (_) {
-      this.log.warn(`${this.device.deviceName}: target mode unavailable; retaining last supported target mode`);
-      return this.lastSupportedTargetMode ?? this.hap.Characteristic.TargetHeaterCoolerState.AUTO;
-    }
-  }
-  private async getCurrentTemp(): Promise<number> {
-    try {
-      const s = await this.state('getCurrentTemp');
-      if (s.currentTemperature !== undefined) this.lastKnownTemp = s.currentTemperature;
-    } catch (_) { /* use last known value */ }
-    return this.lastKnownTemp ?? 0;
-  }
-  private async getTargetTemp(): Promise<number> {
-    try {
-      const s = await this.state('getTargetTemp');
-      if (!s.isOnline && this.lastKnownTarget !== undefined) return this.lastKnownTarget;
-      return s.targetTemperature;
-    } catch (_) {
-      return this.lastKnownTarget ?? 22;
-    }
-  }
-  private async getFanSpeed(): Promise<number> {
-    try {
-      const s = await this.state('getFanSpeed');
-      return s.powerSwitch ? this.windToPercent(s.windSpeed) :
-        this.windToPercent(this.requestedWindSpeed ?? this.lastWindSpeed ?? s.windSpeed);
-    } catch (_) { return this.windToPercent(this.requestedWindSpeed ?? this.lastWindSpeed ?? WIND.AUTO); }
+    } catch (_e) { return this.hap.Characteristic.TargetHeatingCoolingState.OFF; }
   }
 
-  private queueCommand(props: Props | (() => Props | Promise<Props>), ctx: string, keyProps?: Props): Promise<void> {
-    const key = JSON.stringify(keyProps ?? (typeof props === 'function' ? ctx : props));
-    if (key === this.lastCommandKey && Date.now() - this.lastCommandTime < 3000 && this.lastCommandPromise) {
-      return this.lastCommandPromise;
-    }
-    this.lastCommandKey = key;
-    this.lastCommandTime = Date.now();
-    const generation = ++this.commandGeneration;
-    const run = this.commandQueue.then(async () => {
-      // Resolve dynamic commands only after earlier queued commands have
-      // completed, so mode/power payloads use the current target setpoint.
-      const commandProps = typeof props === 'function' ? await props() : props;
-      if (!await this.api.sendCommand(this.device.deviceId, commandProps)) throw new Error(`${ctx} failed`);
-      this.log.debug(`Command succeeded (${ctx})`);
-      this.rememberOptimisticProps(commandProps);
-      setTimeout(() => {
-        if (this.stopped || generation !== this.commandGeneration) return;
-        this.api.getDeviceState(this.device.deviceId, true)
-          .then((s: DeviceState) => {
-            if (!this.stopped && generation === this.commandGeneration) this.updateFromState(s);
-          })
-          .catch((e: unknown) => this.log.debug(`Command refresh failed: ${errMsg(e)}`));
-      }, 1200).unref();
-    });
-    this.lastCommandPromise = run;
-    this.commandQueue = run.catch(() => undefined);
-    void run.catch(() => {
-      if (this.lastCommandPromise === run) {
-        this.lastCommandKey = null;
-        this.lastCommandPromise = undefined;
+  async getCurrentTemp(): Promise<number> {
+    try {
+      const s: DeviceState = await withTimeout(
+        this.api.getDeviceState(this.device.deviceId, false),
+        TIMEOUTS.HOMEKIT_GET, 'getCurrentTemp',
+      );
+      if (s.currentTemperature !== undefined) {
+        this._lastKnownTemp = s.currentTemperature;
+        return s.currentTemperature;
       }
-    });
-    return run;
+      return this._lastKnownTemp ?? 0;
+    } catch (_e) {
+      return this._lastKnownTemp ?? 0;
+    }
   }
 
-  private async setActive(value: number): Promise<void> {
+  async getTargetTemp(): Promise<number> {
     try {
-      const cur = await this.commandState('setActive');
-      await this.queueCommand(value ? async () => {
-        const latest = await this.commandState('setActive latest');
-        return this.modeProps(latest.workMode, latest);
-      } : { powerSwitch: 0 }, 'setActive', { powerSwitch: value ? 1 : 0 });
-      if (value && [MODE.AUTO, MODE.COOL, MODE.HEAT].includes(cur.workMode as 0 | 1 | 4)) {
-        this.lastMode = cur.workMode;
+      const s: DeviceState = await withTimeout(
+        this.api.getDeviceState(this.device.deviceId, false),
+        TIMEOUTS.HOMEKIT_GET, 'getTargetTemp',
+      );
+      return s.targetTemperature ?? 22;
+    } catch (_e) { return 22; }
+  }
+
+  async getFanActive(): Promise<boolean> {
+    try {
+      const s: DeviceState = await withTimeout(
+        this.api.getDeviceState(this.device.deviceId, false),
+        TIMEOUTS.HOMEKIT_GET, 'getFanActive',
+      );
+      return s.powerSwitch === 1;
+    } catch (_e) { return false; }
+  }
+
+  async getFanSpeed(): Promise<number> {
+    try {
+      const s: DeviceState = await withTimeout(
+        this.api.getDeviceState(this.device.deviceId, false),
+        TIMEOUTS.HOMEKIT_GET, 'getFanSpeed',
+      );
+      if (!s.powerSwitch) return 0;
+      return this.windToPercent(s.windSpeed);
+    } catch (_e) { return 0; }
+  }
+
+  // ---- Command queue — prevents duplicate rapid-fire HomeKit taps ----
+
+  private queueCommand(props: Record<string, unknown>, ctx: string): Promise<any> {
+    const commandKey = JSON.stringify(props);
+    if (this._lastCommandKey === commandKey &&
+        Date.now() - this._lastCommandTime < 3000) {
+      this.log.debug(`Duplicate command skipped: ${ctx}`);
+      return Promise.resolve(true);
+    }
+    this._lastCommandKey  = commandKey;
+    this._lastCommandTime = Date.now();
+
+    const next = this.commandQueue
+      .then(() => this.sendOnce(props, ctx))
+      .catch((e) => {
+        this.log.error(`Command queue error (${ctx}): ${errMsg(e)}`);
+      });
+
+    this.commandQueue = next.then(() => {}, () => {});
+    return next;
+  }
+
+  private async sendOnce(props: Record<string, unknown>, ctx: string): Promise<boolean> {
+    const ok = await this.api.sendCommand(this.device.deviceId, props);
+    if (ok) {
+      setTimeout(async () => {
+        try {
+          const ns = await this.api.getDeviceState(this.device.deviceId, true);
+          if (ns) this.updateFromState(ns);
+        } catch (_e) {}
+      }, 1200);
+      return true;
+    }
+    this.log.error(`${ctx} failed`);
+    return false;
+  }
+
+  // ---- Setters ----
+
+  async setTargetMode(value: number): Promise<void> {
+    const C         = this.hap.Characteristic;
+    const modeNames = ['OFF', 'COOL', 'HEAT', 'AUTO'];
+    try {
+      this.log.info(`setTargetMode -> ${modeNames[value] ?? value}`);
+      const cur  = this.api.stateCache[this.device.deviceId] || this.api.defaultState();
+      const temp = cur.targetTemperature ?? 22;
+      const wind = cur.windSpeed         ?? this._lastWindSpeed;
+      let props: Record<string, unknown>;
+
+      switch (value) {
+        case C.TargetHeatingCoolingState.OFF:
+          props = { powerSwitch: 0 };
+          break;
+        case C.TargetHeatingCoolingState.HEAT:
+          this._lastMode = MODE.HEAT;
+          props = { powerSwitch: 1, workMode: MODE.HEAT, windSpeed: wind,
+                    targetCelsiusDegree: temp, targetTemperature: temp,
+                    ECO: 0, sleep: 0, turbo: 0, silenceSwitch: 0 };
+          break;
+        case C.TargetHeatingCoolingState.AUTO:
+          this._lastMode = MODE.AUTO;
+          props = { powerSwitch: 1, workMode: MODE.AUTO, windSpeed: wind,
+                    targetCelsiusDegree: temp, targetTemperature: temp,
+                    ECO: 0, sleep: 0, turbo: 0, silenceSwitch: 0 };
+          break;
+        case C.TargetHeatingCoolingState.COOL:
+        default:
+          this._lastMode = MODE.COOL;
+          props = { powerSwitch: 1, workMode: MODE.COOL, windSpeed: wind,
+                    targetCelsiusDegree: temp, targetTemperature: temp,
+                    ECO: 0, sleep: 0, turbo: 0, silenceSwitch: 0 };
+          break;
       }
-    } catch (e) { throw this.hapError('setActive', e); }
+      await this.queueCommand(props, 'setTargetMode');
+    } catch (e) {
+      this.log.error(`setTargetMode: ${errMsg(e)}`);
+      throw new this.hap.HapStatusError(this.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
   }
-  private async setTargetMode(value: number): Promise<void> {
+
+  async setTargetTemp(value: number): Promise<void> {
     try {
-      const cur = await this.commandState('setTargetMode');
-      const mode = this.hkToWorkMode(value);
-      await this.queueCommand(async () => {
-        const latest = await this.commandState('setTargetMode latest');
-        return this.modeProps(mode, latest);
-      }, 'setTargetMode', this.modeProps(mode, cur));
-      this.lastMode = mode;
-      this.lastSupportedTargetMode = value;
-    } catch (e) { throw this.hapError('setTargetMode', e); }
-  }
-  private async setTargetTemp(value: number): Promise<void> {
-    try {
-      const temp = Math.max(this.minTemp, Math.min(this.maxTemp, Math.round(value)));
-      const cur = await this.commandState('setTargetTemp');
-      const target = { targetCelsiusDegree: temp, targetTemperature: temp };
-      if (cur.powerSwitch) {
-        await this.queueCommand(target, 'setTargetTemp');
+      const temp = Math.max(this._minTemp, Math.min(this._maxTemp, Math.round(value)));
+      const cur  = this.api.stateCache[this.device.deviceId] || this.api.defaultState();
+      this.log.info(`setTargetTemp -> ${temp}C (power=${cur.powerSwitch}, mode=${cur.workMode})`);
+
+      let props: Record<string, unknown>;
+      if (!cur.powerSwitch) {
+        props = { powerSwitch: 1, workMode: this._lastMode, windSpeed: this._lastWindSpeed,
+                  targetCelsiusDegree: temp, targetTemperature: temp };
       } else {
-        if (!cur.isOnline) throw new Error('setTargetTemp: fresh device state unavailable while off');
-        const windSpeed = this.requestedWindSpeed ?? this.lastWindSpeed ?? cur.windSpeed;
-        await this.queueCommand(async () => {
-          const latest = await this.commandState('setTargetTemp latest');
-          const latestWind = this.requestedWindSpeed ?? this.lastWindSpeed ?? latest.windSpeed;
-          return {
-            powerSwitch: latest.powerSwitch, workMode: latest.workMode,
-            windSpeed: latestWind, ...target,
-          };
-        }, 'setTargetTemp', {
-          powerSwitch: cur.powerSwitch, workMode: cur.workMode, windSpeed, ...target,
-        });
+        props = { targetCelsiusDegree: temp, targetTemperature: temp };
       }
-      this.updateThresholds(temp);
-    } catch (e) { throw this.hapError('setTargetTemp', e); }
+
+      await this.queueCommand(props, 'setTargetTemp');
+      this.thermo.getCharacteristic(this.hap.Characteristic.TargetTemperature).updateValue(temp);
+    } catch (e) {
+      this.log.error(`setTargetTemp: ${errMsg(e)}`);
+      throw new this.hap.HapStatusError(this.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
   }
-  private async setFanActive(value: boolean): Promise<void> {
+
+  async setFanActive(value: boolean): Promise<void> {
     try {
-      const cur = await this.commandState('setFanActive');
-      if (value !== !!cur.powerSwitch) {
-        await this.queueCommand(value ? async () => {
-          const latest = await this.commandState('setFanActive latest');
-          return this.modeProps(latest.workMode, latest);
-        } : { powerSwitch: 0 }, 'setFanActive', { powerSwitch: value ? 1 : 0 });
-        if (value && [MODE.AUTO, MODE.COOL, MODE.HEAT].includes(cur.workMode as 0 | 1 | 4)) {
-          this.lastMode = cur.workMode;
+      this.log.info(`setFanActive -> ${value ? 'ON' : 'OFF'}`);
+      if (!value) {
+        await this.queueCommand({ powerSwitch: 0 }, 'setFanActive:off');
+      } else {
+        const cur = this.api.stateCache[this.device.deviceId] || this.api.defaultState();
+        if (!cur.powerSwitch) {
+          await this.queueCommand(
+            { powerSwitch: 1, workMode: this._lastMode, windSpeed: this._lastWindSpeed },
+            'setFanActive:on',
+          );
         }
       }
-    } catch (e) { throw this.hapError('setFanActive', e); }
-  }
-  private async setFanSpeed(value: number): Promise<void> {
-    try {
-      const wind = this.percentToWind(value);
-      const cur = await this.commandState('setFanSpeed');
-      if (cur.powerSwitch) {
-        await this.queueCommand({ windSpeed: wind }, 'setFanSpeed');
-        this.lastWindSpeed = wind;
-        this.requestedWindSpeed = undefined;
-      } else {
-        this.requestedWindSpeed = wind;
-      }
-      this.fanSpeedSelected = true;
-    } catch (e) { throw this.hapError('setFanSpeed', e); }
+    } catch (e) {
+      this.log.error(`setFanActive: ${errMsg(e)}`);
+      throw new this.hap.HapStatusError(this.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
   }
 
-  private modeProps(mode: number, cur: DeviceState): Props {
-    if (![MODE.AUTO, MODE.COOL, MODE.HEAT].includes(mode as 0 | 1 | 4)) {
-      this.log.warn(`${this.device.deviceName}: unsupported TCL mode ${mode}; retaining last supported target mode`);
-      mode = this.lastSupportedTargetMode === undefined ? MODE.AUTO : this.hkToWorkMode(this.lastSupportedTargetMode);
+  async setFanSpeed(value: number): Promise<void> {
+    try {
+      const wind          = this.percentToWind(value);
+      this._lastWindSpeed = wind;
+      const cur           = this.api.stateCache[this.device.deviceId] || this.api.defaultState();
+      const windNames: Record<number, string> = {
+        0: 'Auto', 2: 'Silent', 3: 'Low', 4: 'Medium', 5: 'Med-High', 6: 'High',
+      };
+      this.log.info(
+        `setFanSpeed -> ${value}% -> wind=${wind} (${windNames[wind]}) | power=${cur.powerSwitch}`,
+      );
+      if (!cur.powerSwitch) { this.log.debug('Device is off, speed saved for next start'); return; }
+      await this.queueCommand({ windSpeed: wind }, 'setFanSpeed');
+    } catch (e) {
+      this.log.error(`setFanSpeed: ${errMsg(e)}`);
+      throw new this.hap.HapStatusError(this.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
-    const windSpeed = cur.powerSwitch ? cur.windSpeed :
-      this.requestedWindSpeed ?? this.lastWindSpeed ?? cur.windSpeed;
-    return { powerSwitch: 1, workMode: mode, windSpeed,
-      targetCelsiusDegree: cur.targetTemperature, targetTemperature: cur.targetTemperature,
-      ECO: 0, sleep: 0, turbo: 0, silenceSwitch: 0 };
   }
-  private hkToWorkMode(value: number): number {
-    const C = this.hap.Characteristic.TargetHeaterCoolerState;
-    return value === C.HEAT ? MODE.HEAT : value === C.AUTO ? MODE.AUTO : MODE.COOL;
-  }
-  private workModeToHk(mode: number): number {
-    const C = this.hap.Characteristic.TargetHeaterCoolerState;
-    if (mode === MODE.HEAT) { this.lastSupportedTargetMode = C.HEAT; return C.HEAT; }
-    if (mode === MODE.AUTO) { this.lastSupportedTargetMode = C.AUTO; return C.AUTO; }
-    if (mode === MODE.COOL) { this.lastSupportedTargetMode = C.COOL; return C.COOL; }
-    this.log.warn(`${this.device.deviceName}: unsupported TCL mode ${mode}; retaining last supported target mode`);
-    return this.lastSupportedTargetMode ?? C.AUTO;
-  }
-  private hapError(ctx: string, error: unknown): Error {
-    this.log.error(`${ctx}: ${errMsg(error)}`);
-    return new this.hap.HapStatusError(this.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-  }
+
+  // ---- HomeKit state push ----
 
   updateFromState(s: DeviceState): void {
-    if (s.lastUpdated < this.lastAppliedStateTime) return;
-    this.lastAppliedStateTime = s.lastUpdated;
-    const reconciled = { ...s };
-    for (const key of ['powerSwitch', 'workMode', 'windSpeed', 'targetTemperature'] as const) {
-      const desired = this.optimisticState[key];
-      if (desired === undefined) continue;
-      if (s[key] === desired) delete this.optimisticState[key];
-      else reconciled[key] = desired;
-    }
-    this.rememberState(reconciled);
-    const key = `${reconciled.powerSwitch}-${reconciled.workMode}-${reconciled.windSpeed}-${reconciled.currentTemperature}-${reconciled.targetTemperature}`;
-    if (key === this.lastStateKey) return;
-    this.lastStateKey = key;
-    this.minTemp = reconciled.minTemp || this.minTemp;
-    this.maxTemp = reconciled.maxTemp || this.maxTemp;
-    this.lastKnownTarget = reconciled.targetTemperature;
-    if (reconciled.currentTemperature !== undefined) this.lastKnownTemp = reconciled.currentTemperature;
+    const key = `${s.powerSwitch}-${s.workMode}-${s.windSpeed}-${s.currentTemperature}-${s.targetTemperature}`;
+    if (key === this._lastStateKey) return;
+    this._lastStateKey = key;
+
+    this.log.debug(
+      `power=${s.powerSwitch} mode=${s.workMode} wind=${s.windSpeed} ` +
+      `room=${s.currentTemperature ?? '?'}C target=${s.targetTemperature}C`,
+    );
+
+    if (s.powerSwitch && s.workMode !== undefined) this._lastMode      = s.workMode;
+    if (s.windSpeed  !== undefined)                this._lastWindSpeed = s.windSpeed;
+    if (s.minTemp)                                 this._minTemp       = s.minTemp;
+    if (s.maxTemp)                                 this._maxTemp       = s.maxTemp;
+
     const C = this.hap.Characteristic;
-    if (this.lastKnownTemp !== undefined) this.heaterCooler.updateCharacteristic(C.CurrentTemperature, this.lastKnownTemp);
-    if (reconciled.targetTemperature !== undefined) this.updateThresholds(reconciled.targetTemperature);
-    this.heaterCooler.updateCharacteristic(C.Active, reconciled.powerSwitch ? 1 : 0);
-    this.heaterCooler.updateCharacteristic(C.CurrentHeaterCoolerState, !reconciled.powerSwitch ? C.CurrentHeaterCoolerState.INACTIVE :
-      reconciled.workMode === MODE.HEAT ? C.CurrentHeaterCoolerState.HEATING :
-      reconciled.workMode === MODE.COOL ? C.CurrentHeaterCoolerState.COOLING : C.CurrentHeaterCoolerState.IDLE);
-    this.heaterCooler.updateCharacteristic(C.TargetHeaterCoolerState, this.workModeToHk(reconciled.workMode));
-    this.fanSvc.updateCharacteristic(C.On, !!reconciled.powerSwitch);
-    this.fanSvc.updateCharacteristic(C.RotationSpeed,
-      reconciled.powerSwitch ? this.windToPercent(reconciled.windSpeed) :
-        this.windToPercent(this.requestedWindSpeed ?? this.lastWindSpeed ?? reconciled.windSpeed));
-  }
-  private rememberOptimisticProps(props: Props): void {
-    for (const key of ['powerSwitch', 'workMode', 'windSpeed'] as const) {
-      if (typeof props[key] === 'number') this.optimisticState[key] = props[key] as number;
+
+    if (s.currentTemperature !== undefined) {
+      this._lastKnownTemp = s.currentTemperature;
+      this.thermo.updateCharacteristic(C.CurrentTemperature, s.currentTemperature);
+    } else if (this._lastKnownTemp !== undefined && this._lastKnownTemp !== null) {
+      this.thermo.updateCharacteristic(C.CurrentTemperature, this._lastKnownTemp);
     }
-    const target = props.targetCelsiusDegree ?? props.targetTemperature;
-    if (typeof target === 'number') this.optimisticState.targetTemperature = target;
-  }
-  private updateThresholds(temp: number): void {
-    const C = this.hap.Characteristic;
-    this.heaterCooler.updateCharacteristic(C.HeatingThresholdTemperature, temp);
-    this.heaterCooler.updateCharacteristic(C.CoolingThresholdTemperature, temp);
-  }
-  private windToPercent(wind: number): number {
-    return ({ [WIND.AUTO]: 0, [WIND.SILENT]: 12.5, [WIND.MED_LOW]: 37.5, [WIND.MED]: 50, [WIND.MED_HIGH]: 62.5, [WIND.HIGH]: 87.5 } as Record<number, number>)[wind] ?? 0;
-  }
-  private percentToWind(value: number): number {
-    if (value <= 0) return WIND.AUTO;
-    if (value <= 25) return WIND.SILENT;
-    if (value <= 37.5) return WIND.MED_LOW;
-    if (value <= 50) return WIND.MED;
-    if (value <= 62.5) return WIND.MED_HIGH;
-    return WIND.HIGH;
+
+    if (s.targetTemperature !== undefined)
+      this.thermo.updateCharacteristic(C.TargetTemperature, s.targetTemperature);
+
+    const curMode = !s.powerSwitch
+      ? C.CurrentHeatingCoolingState.OFF
+      : s.workMode === MODE.HEAT
+        ? C.CurrentHeatingCoolingState.HEAT
+        : C.CurrentHeatingCoolingState.COOL;
+
+    const tgtMode = !s.powerSwitch
+      ? C.TargetHeatingCoolingState.OFF
+      : this.workModeToHk(s.workMode);
+
+    this.thermo.updateCharacteristic(C.CurrentHeatingCoolingState, curMode);
+    this.thermo.updateCharacteristic(C.TargetHeatingCoolingState, tgtMode);
+    this.fanSvc.updateCharacteristic(C.On, s.powerSwitch === 1);
+    this.fanSvc.updateCharacteristic(C.RotationSpeed, s.powerSwitch ? this.windToPercent(s.windSpeed) : 0);
   }
 
-  private startPolling(): void {
-    this.pollTimer = setInterval(() => this.poll(), 3000);
-    this.pollTimer.unref();
-    this.staleTimer = setInterval(() => {
-      const cached = this.api.stateCache[this.device.deviceId];
-      if (cached && Date.now() - cached.lastUpdated > 45000) delete this.api.stateCache[this.device.deviceId];
-    }, 30000);
-    this.staleTimer.unref();
+  // ---- Helpers ----
+
+  private workModeToHk(workMode: number): number {
+    const C = this.hap.Characteristic;
+    switch (workMode) {
+      case MODE.COOL: return C.TargetHeatingCoolingState.COOL;
+      case MODE.HEAT: return C.TargetHeatingCoolingState.HEAT;
+      case MODE.AUTO: return C.TargetHeatingCoolingState.AUTO;
+      default:        return C.TargetHeatingCoolingState.COOL;
+    }
   }
-  private async poll(): Promise<void> {
-    if (this.stopped) return;
-    if (this.pollInFlight) return this.pollInFlight;
-    const run = (async () => {
+
+  private windToPercent(wind: number): number {
+    switch (wind) {
+      case 0: return 0;
+      case 2: return 12.5;
+      case 3: return 37.5;
+      case 4: return 50;
+      case 5: return 62.5;
+      case 6: return 87.5;
+      default: return 0;
+    }
+  }
+
+  private percentToWind(pct: number): number {
+    if (pct <= 0)    return 0;
+    if (pct <= 25)   return 2;
+    if (pct <= 37.5) return 3;
+    if (pct <= 50)   return 4;
+    if (pct <= 62.5) return 5;
+    return 6;
+  }
+
+  // ---- Polling ----
+
+  private startPolling(): void {
+    setInterval(async () => {
       try {
-        const s = await this.api.getDeviceState(this.device.deviceId, Date.now() - this.lastOkPoll > 10000);
-        if (this.stopped) return;
-        if (!s.isOnline) throw new Error('device state is offline');
-        this.errCount = 0; this.lastOkPoll = Date.now(); this.updateFromState(s);
-      } catch (e) {
-        this.errCount++;
-        this.log.warn(`${this.device.deviceName}: poll failed (${this.errCount}): ${errMsg(e)}`);
-        if (this.errCount >= 3) { this.errCount = 0; await this.api.reAuth(); }
+        const force = Date.now() - this._lastOkPoll > 10000;
+        const s     = await this.api.getDeviceState(this.device.deviceId, force);
+        if (s) {
+          this._errCount   = 0;
+          this._lastOkPoll = Date.now();
+          this.updateFromState(s);
+        }
+      } catch (err) {
+        this._errCount++;
+        const msg       = errMsg(err);
+        const isAuthErr = msg.includes('Forbidden') || msg.includes('expired') || msg.includes('InvalidToken');
+        if (isAuthErr || this._errCount >= 3) {
+          this.log.warn('Re-authenticating...');
+          this._errCount = 0;
+          await this.api.reAuth();
+        }
       }
-    })();
-    this.pollInFlight = run;
-    void run.then(() => {
-      if (this.pollInFlight === run) this.pollInFlight = undefined;
-    }, () => {
-      if (this.pollInFlight === run) this.pollInFlight = undefined;
-    });
-    return run;
+    }, 3000).unref();
+
+    setInterval(() => {
+      const cached = this.api.stateCache[this.device.deviceId];
+      if (cached && Date.now() - cached.lastUpdated > 45000) {
+        delete this.api.stateCache[this.device.deviceId];
+        this.log.debug(`State cache cleared for ${this.device.deviceId}`);
+      }
+    }, 30000).unref();
+
+    if (!this.api._credRefreshStarted) {
+      this.api._credRefreshStarted = true;
+      setInterval(() => this.api.refreshCredentials(), 50 * 60 * 1000).unref();
+      this.log.debug('AWS credentials auto-refresh scheduled (every 50 min)');
+    }
   }
 }

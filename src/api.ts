@@ -11,7 +11,6 @@ import {
   DeviceState,
   PluginConfig,
   RefreshTokensData,
-  TclDevice,
 } from './types.js';
 import { MODE, TIMEOUTS, WIND } from './constants.js';
 import { errMsg, withTimeout } from './utils.js';
@@ -36,8 +35,6 @@ export class TclHomeApi {
 
   public  stateCache:          Record<string, DeviceState> = {};
   private lastCall:            Record<string, number>      = {};
-  private stateRequestSequence: Record<string, number>   = {};
-  private stateCommitSequence:  Record<string, number>    = {};
   private authRetry:           number  = 0;
   private maxAuthRetry:        number  = 3;
   private _reAuthInProgress:   boolean = false;
@@ -170,7 +167,7 @@ export class TclHomeApi {
     this.log.info('AWS IoT ready');
   }
 
-  async getDevices(): Promise<TclDevice[]> {
+  async getDevices(): Promise<any[]> {
     const url       = `${this.cloudUrlsData!.data.device_url}/v3/user/get_things`;
     const timestamp = Date.now().toString();
     const nonce     = Math.random().toString(36).substr(2, 16);
@@ -188,13 +185,11 @@ export class TclHomeApi {
       }),
       TIMEOUTS.HTTP, 'getDevices',
     );
-    return (resp.data.data || []) as TclDevice[];
+    return resp.data.data || [];
   }
 
   async getDeviceState(deviceId: string, force = false): Promise<DeviceState> {
     const now = Date.now();
-    const requestSequence = (this.stateRequestSequence[deviceId] || 0) + 1;
-    this.stateRequestSequence[deviceId] = requestSequence;
 
     // Debounce: don't hammer AWS more than once per 200 ms.
     if (!force && this.lastCall[deviceId] && now - this.lastCall[deviceId] < 200) {
@@ -236,30 +231,17 @@ export class TclHomeApi {
         deviceId, state.powerSwitch, state.workMode, state.windSpeed,
         state.targetTemperature, state.currentTemperature ?? '?',
       );
-      // A slower shadow response must not replace a result from a request
-      // that started later.
-      if (requestSequence >= (this.stateCommitSequence[deviceId] || 0)) {
-        this.stateCache[deviceId] = state;
-        this.stateCommitSequence[deviceId] = requestSequence;
-        return state;
-      }
-      return this.stateCache[deviceId] || state;
+      this.stateCache[deviceId] = state;
+      return state;
 
     } catch (err) {
       this.log.debug(`Shadow read failed: ${errMsg(err)}`);
       const cached = this.stateCache[deviceId];
-      if (requestSequence < (this.stateCommitSequence[deviceId] || 0)) {
-        return cached || this.defaultState();
-      }
       if (cached && now - cached.lastUpdated > 30000) {
         delete this.stateCache[deviceId];
         return this.defaultState();
       }
-      if (cached) {
-        cached.isOnline = false;
-        return cached;
-      }
-      return this.defaultState();
+      return cached || this.defaultState();
     }
   }
 
@@ -287,25 +269,19 @@ export class TclHomeApi {
     const MAX_ATTEMPTS    = 2;
     const PUBLISH_TIMEOUT = 4000;
 
-    let reauthed = false;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
-        const cached = this.stateCache[deviceId];
-        const cachedTimestamp = cached?.lastUpdated;
         await withTimeout(
           this.iotData.publish({ topic, payload, qos: 0 }).promise(),
           PUBLISH_TIMEOUT, 'publish',
         );
 
         // Optimistically update the cache so HomeKit reflects the change immediately.
-        const current = this.stateCache[deviceId];
-        // A poll may have replaced the cache while publish was in flight. Never
-        // let an older optimistic write overwrite that newer reported state.
-        if (current && current === cached && current.lastUpdated === cachedTimestamp) {
-          Object.assign(current, props);
+        if (this.stateCache[deviceId]) {
+          Object.assign(this.stateCache[deviceId], props);
           const p = props as any;
           if (p.targetCelsiusDegree !== undefined)
-            current.targetTemperature = p.targetCelsiusDegree;
+            this.stateCache[deviceId].targetTemperature = p.targetCelsiusDegree;
         }
 
         this.log.debug(`Command sent (attempt ${attempt})`);
@@ -315,11 +291,10 @@ export class TclHomeApi {
         const msg = errMsg(err);
         this.log.warn(`Publish attempt ${attempt}/${MAX_ATTEMPTS} failed: ${msg}`);
 
-        if (!reauthed && (msg.includes('Forbidden') || msg.includes('expired') || msg.includes('InvalidToken'))) {
+        if (msg.includes('Forbidden') || msg.includes('expired') || msg.includes('InvalidToken')) {
           this.log.warn('Credentials expired, triggering re-auth...');
           await this.reAuth();
-          reauthed = true;
-          continue;
+          return false;
         }
       }
     }

@@ -1,21 +1,5 @@
 import { Logging } from 'homebridge';
 
-export interface TclDevice {
-  deviceId: string;
-  deviceName: string;
-  category?: string;
-  firmwareVersion?: string;
-}
-
-export interface PluginConfig {
-  username: string;
-  password: string;
-  appLoginUrl?: string;
-  cloudUrls?: string;
-  appId?: string;
-  log: Logging;
-}
-
 export interface DeviceState {
   powerSwitch:        number;
   workMode:           number;
@@ -26,6 +10,15 @@ export interface DeviceState {
   maxTemp:            number;
   isOnline:           boolean;
   lastUpdated:        number;
+}
+
+export interface PluginConfig {
+  username:    string;
+  password:    string;
+  appLoginUrl?: string;
+  cloudUrls?:  string;
+  appId?:      string;
+  log:         Logging;
 }
 
 export interface AuthData {
