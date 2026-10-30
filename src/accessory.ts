@@ -327,8 +327,7 @@ export class TclAirConditioner {
     const windSpeed = cur.powerSwitch ? cur.windSpeed :
       this.requestedWindSpeed ?? this.lastWindSpeed ?? cur.windSpeed;
     return { powerSwitch: 1, workMode: mode, windSpeed,
-      targetCelsiusDegree: cur.targetTemperature, targetTemperature: cur.targetTemperature,
-      ECO: 0, sleep: 0, turbo: 0, silenceSwitch: 0 };
+      targetCelsiusDegree: cur.targetTemperature, targetTemperature: cur.targetTemperature };
   }
   private hkToWorkMode(value: number): number {
     const C = this.hap.Characteristic.TargetHeatingCoolingState;
