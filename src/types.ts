@@ -19,7 +19,7 @@ export interface PluginConfig {
 export interface DeviceState {
   powerSwitch:        number;
   workMode:           number;
-  windSpeed:          number;
+  windSpeed?:         number;
   targetTemperature:  number;
   currentTemperature: number | undefined;
   minTemp:            number;

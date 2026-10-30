@@ -1,6 +1,6 @@
 import { Logging } from 'homebridge';
 import { TclHomePlatform } from './platform.js';
-import { MODE, TIMEOUTS, WIND } from './constants.js';
+import { MODE, TIMEOUTS } from './constants.js';
 import { DeviceState, TclDevice } from './types.js';
 import { errMsg, withTimeout } from './utils.js';
 
@@ -14,17 +14,12 @@ export class TclAirConditioner {
   private readonly api: any;
   private readonly hap: any;
   private thermostat: any;
-  private fanSelector: any;
-  private fanInputs = new Map<number, any>();
   private pollTimer?: ReturnType<typeof setInterval>;
   private staleTimer?: ReturnType<typeof setInterval>;
   private lastMode?: number;
-  private lastWindSpeed?: number;
-  private requestedWindSpeed?: number;
   private lastPowerSwitch?: number;
   private lastKnownTarget?: number;
   private lastSupportedTargetMode?: number;
-  private fanSpeedSelected = false;
   private minTemp = 16;
   private maxTemp = 31;
   private lastKnownTemp?: number;
@@ -50,9 +45,8 @@ export class TclAirConditioner {
     this.hap = platform.api.hap;
     this.setupAccessoryInfo();
     this.setupThermostat();
-    this.setupFan();
     this.startPolling();
-    this.log.info(`${device.deviceName} ready (Thermostat | 16-31C | 8 fan speeds)`);
+    this.log.info(`${device.deviceName} ready (Thermostat | 16-31C)`);
   }
 
   stop(): void {
@@ -93,42 +87,6 @@ export class TclAirConditioner {
       .onGet(() => C.TemperatureDisplayUnits.CELSIUS);
   }
 
-  private setupFan(): void {
-    const C = this.hap.Characteristic;
-    this.fanSelector = this.accessory.getService('Fan Speed Selector')
-      || this.accessory.addService(this.hap.Service.Television, 'Fan Speed Selector', 'fanSpeedSelector');
-    this.fanSelector
-      .setCharacteristic(C.ConfiguredName, 'Fan Speed')
-      .setCharacteristic(C.SleepDiscoveryMode, C.SleepDiscoveryMode.ALWAYS_DISCOVERABLE)
-      .setCharacteristic(C.Active, C.Active.ACTIVE)
-      .setCharacteristic(C.ActiveIdentifier, 1);
-    this.fanSelector.getCharacteristic(C.ActiveIdentifier)
-      .onGet(() => this.getFanModeIdentifier())
-      .onSet((v: number) => this.setFanModeIdentifier(v));
-
-    for (const mode of this.fanModeDefinitions()) {
-      const input = this.accessory.getService(mode.name)
-        || this.accessory.addService(this.hap.Service.InputSource, mode.name, `fanMode-${mode.id}`);
-      input.setCharacteristic(C.Identifier, mode.id)
-        .setCharacteristic(C.ConfiguredName, mode.name)
-        .setCharacteristic(C.IsConfigured, C.IsConfigured.CONFIGURED)
-        .setCharacteristic(C.InputSourceType, C.InputSourceType.OTHER);
-      this.fanSelector.addLinkedService(input);
-      this.fanInputs.set(mode.id, input);
-    }
-  }
-
-  private fanModeDefinitions(): Array<{ id: number; name: string; wind: number }> {
-    return [
-      { id: 1, name: 'Auto', wind: WIND.AUTO },
-      { id: 2, name: 'Silent', wind: WIND.SILENT },
-      { id: 3, name: 'Low', wind: WIND.MED_LOW },
-      { id: 4, name: 'Medium', wind: WIND.MED },
-      { id: 5, name: 'Medium-High', wind: WIND.MED_HIGH },
-      { id: 6, name: 'High', wind: WIND.HIGH },
-    ];
-  }
-
   private async state(ctx: string): Promise<DeviceState> {
     const state = await withTimeout(this.api.getDeviceState(this.device.deviceId, false), TIMEOUTS.HOMEKIT_GET, ctx) as DeviceState;
     this.rememberState(state);
@@ -140,9 +98,6 @@ export class TclAirConditioner {
     this.lastPowerSwitch = s.powerSwitch;
     this.lastMode = s.workMode;
     this.lastKnownTarget = s.targetTemperature;
-    if (this.lastWindSpeed === undefined || !this.fanSpeedSelected) {
-      this.lastWindSpeed = s.windSpeed;
-    }
   }
 
   private async commandState(ctx: string): Promise<DeviceState> {
@@ -158,12 +113,11 @@ export class TclAirConditioner {
     if (current) return current;
 
     if (this.lastPowerSwitch !== undefined && this.lastMode !== undefined &&
-        this.lastWindSpeed !== undefined && this.lastKnownTarget !== undefined) {
+        this.lastKnownTarget !== undefined) {
       this.log.warn(`${this.device.deviceName}: ${ctx} using last-known state while a fresh state is unavailable`);
       return {
         powerSwitch: this.lastPowerSwitch,
         workMode: this.lastMode,
-        windSpeed: this.lastWindSpeed,
         targetTemperature: this.lastKnownTarget,
         currentTemperature: this.lastKnownTemp,
         minTemp: this.minTemp,
@@ -221,17 +175,6 @@ export class TclAirConditioner {
       return this.lastKnownTarget ?? 22;
     }
   }
-  private async getFanModeIdentifier(): Promise<number> {
-    try {
-      const s = await this.state('getFanModeIdentifier');
-      return this.windToIdentifier(s.powerSwitch
-        ? s.windSpeed
-        : this.requestedWindSpeed ?? this.lastWindSpeed ?? s.windSpeed);
-    } catch (_) {
-      return this.windToIdentifier(this.requestedWindSpeed ?? this.lastWindSpeed ?? WIND.AUTO);
-    }
-  }
-
   private queueCommand(props: Props | (() => Props | Promise<Props>), ctx: string, keyProps?: Props): Promise<void> {
     const key = JSON.stringify(keyProps ?? (typeof props === 'function' ? ctx : props));
     if (key === this.lastCommandKey && Date.now() - this.lastCommandTime < 3000 && this.lastCommandPromise) {
@@ -305,48 +248,25 @@ export class TclAirConditioner {
         await this.queueCommand(target, 'setTargetTemp');
       } else {
         if (!cur.isOnline) throw new Error('setTargetTemp: fresh device state unavailable while off');
-        const windSpeed = this.requestedWindSpeed ?? this.lastWindSpeed ?? cur.windSpeed;
         await this.queueCommand(async () => {
           const latest = await this.commandState('setTargetTemp latest');
-          const latestWind = this.requestedWindSpeed ?? this.lastWindSpeed ?? latest.windSpeed;
           return {
             powerSwitch: latest.powerSwitch, workMode: latest.workMode,
-            windSpeed: latestWind, ...target,
+            ...target,
           };
         }, 'setTargetTemp', {
-          powerSwitch: cur.powerSwitch, workMode: cur.workMode, windSpeed, ...target,
+          powerSwitch: cur.powerSwitch, workMode: cur.workMode, ...target,
         });
       }
       this.updateTargetTemperature(temp);
     } catch (e) { throw this.hapError('setTargetTemp', e); }
   }
-  private async setFanModeIdentifier(identifier: number): Promise<void> {
-    const mode = this.fanModeDefinitions().find((entry) => entry.id === identifier);
-    if (!mode) throw this.hapError('setFanModeIdentifier', new Error(`Unknown fan mode identifier: ${identifier}`));
-    try {
-      const cur = await this.commandState('setFanModeIdentifier');
-      if (cur.powerSwitch) {
-        await this.queueCommand({ windSpeed: mode.wind }, 'setFanModeIdentifier', { windSpeed: mode.wind });
-        this.lastWindSpeed = mode.wind;
-        this.requestedWindSpeed = undefined;
-      } else {
-        this.requestedWindSpeed = mode.wind;
-      }
-      this.fanSpeedSelected = true;
-      this.fanSelector.updateCharacteristic(this.hap.Characteristic.ActiveIdentifier, identifier);
-    } catch (e) {
-      throw this.hapError('setFanModeIdentifier', e);
-    }
-  }
-
   private modeProps(mode: number, cur: DeviceState): Props {
     if (![MODE.AUTO, MODE.COOL, MODE.HEAT].includes(mode as 0 | 1 | 4)) {
       this.log.warn(`${this.device.deviceName}: unsupported TCL mode ${mode}; retaining AUTO fallback`);
       mode = this.lastSupportedTargetMode === undefined ? MODE.AUTO : this.hkToWorkMode(this.lastSupportedTargetMode);
     }
-    const windSpeed = cur.powerSwitch ? cur.windSpeed :
-      this.requestedWindSpeed ?? this.lastWindSpeed ?? cur.windSpeed;
-    return { powerSwitch: 1, workMode: mode, windSpeed,
+    return { powerSwitch: 1, workMode: mode,
       targetCelsiusDegree: cur.targetTemperature, targetTemperature: cur.targetTemperature };
   }
   private hkToWorkMode(value: number): number {
@@ -370,14 +290,14 @@ export class TclAirConditioner {
     if (s.lastUpdated < this.lastAppliedStateTime) return;
     this.lastAppliedStateTime = s.lastUpdated;
     const reconciled = { ...s };
-    for (const key of ['powerSwitch', 'workMode', 'windSpeed', 'targetTemperature'] as const) {
+    for (const key of ['powerSwitch', 'workMode', 'targetTemperature'] as const) {
       const desired = this.optimisticState[key];
       if (desired === undefined) continue;
       if (s[key] === desired) delete this.optimisticState[key];
       else reconciled[key] = desired;
     }
     this.rememberState(reconciled);
-    const key = `${reconciled.powerSwitch}-${reconciled.workMode}-${reconciled.windSpeed}-${reconciled.currentTemperature}-${reconciled.targetTemperature}`;
+    const key = `${reconciled.powerSwitch}-${reconciled.workMode}-${reconciled.currentTemperature}-${reconciled.targetTemperature}`;
     if (key === this.lastStateKey) return;
     this.lastStateKey = key;
     this.minTemp = reconciled.minTemp || this.minTemp;
@@ -393,15 +313,9 @@ export class TclAirConditioner {
       C.CurrentHeatingCoolingState.OFF);
     this.thermostat.updateCharacteristic(C.TargetHeatingCoolingState,
       reconciled.powerSwitch ? this.workModeToHk(reconciled.workMode) : C.TargetHeatingCoolingState.OFF);
-    this.fanSelector.updateCharacteristic(
-      C.ActiveIdentifier,
-      this.windToIdentifier(reconciled.powerSwitch
-        ? reconciled.windSpeed
-        : this.requestedWindSpeed ?? this.lastWindSpeed ?? reconciled.windSpeed),
-    );
   }
   private rememberOptimisticProps(props: Props): void {
-    for (const key of ['powerSwitch', 'workMode', 'windSpeed'] as const) {
+    for (const key of ['powerSwitch', 'workMode'] as const) {
       if (typeof props[key] === 'number') this.optimisticState[key] = props[key] as number;
     }
     const target = props.targetCelsiusDegree ?? props.targetTemperature;
@@ -411,10 +325,6 @@ export class TclAirConditioner {
     const C = this.hap.Characteristic;
     this.thermostat.updateCharacteristic(C.TargetTemperature, temp);
   }
-  private windToIdentifier(wind: number): number {
-    return this.fanModeDefinitions().find((mode) => mode.wind === wind)?.id ?? 1;
-  }
-
   private startPolling(): void {
     this.pollTimer = setInterval(() => this.poll(), 3000);
     this.pollTimer.unref();
