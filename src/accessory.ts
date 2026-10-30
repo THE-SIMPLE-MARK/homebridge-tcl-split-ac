@@ -14,7 +14,6 @@ export class TclAirConditioner {
   private readonly api: any;
   private readonly hap: any;
   private thermostat: any;
-  private fanSvc: any;
   private fanSelector: any;
   private fanInputs = new Map<number, any>();
   private pollTimer?: ReturnType<typeof setInterval>;
@@ -96,13 +95,13 @@ export class TclAirConditioner {
 
   private setupFan(): void {
     const C = this.hap.Characteristic;
-    this.fanSvc = this.accessory.getService('Fan Speed Control')
-      || this.accessory.addService(this.hap.Service.Fan, 'Fan Speed Control', 'fanSpeedControl');
-    this.fanSvc.getCharacteristic(C.On).onGet(() => this.getActive()).onSet((v: boolean) => this.setFanActive(v));
-
     this.fanSelector = this.accessory.getService('Fan Speed Selector')
       || this.accessory.addService(this.hap.Service.Television, 'Fan Speed Selector', 'fanSpeedSelector');
-    this.fanSelector.setCharacteristic(C.ConfiguredName, 'Fan Speed');
+    this.fanSelector
+      .setCharacteristic(C.ConfiguredName, 'Fan Speed')
+      .setCharacteristic(C.SleepDiscoveryMode, C.SleepDiscoveryMode.ALWAYS_DISCOVERABLE)
+      .setCharacteristic(C.Active, C.Active.ACTIVE)
+      .setCharacteristic(C.ActiveIdentifier, 1);
     this.fanSelector.getCharacteristic(C.ActiveIdentifier)
       .onGet(() => this.getFanModeIdentifier())
       .onSet((v: number) => this.setFanModeIdentifier(v));
@@ -112,6 +111,7 @@ export class TclAirConditioner {
         || this.accessory.addService(this.hap.Service.InputSource, mode.name, `fanMode-${mode.id}`);
       input.setCharacteristic(C.Identifier, mode.id)
         .setCharacteristic(C.ConfiguredName, mode.name)
+        .setCharacteristic(C.IsConfigured, C.IsConfigured.CONFIGURED)
         .setCharacteristic(C.InputSourceType, C.InputSourceType.OTHER);
       this.fanSelector.addLinkedService(input);
       this.fanInputs.set(mode.id, input);
@@ -320,20 +320,6 @@ export class TclAirConditioner {
       this.updateTargetTemperature(temp);
     } catch (e) { throw this.hapError('setTargetTemp', e); }
   }
-  private async setFanActive(value: boolean): Promise<void> {
-    try {
-      const cur = await this.commandState('setFanActive');
-      if (value !== !!cur.powerSwitch) {
-        await this.queueCommand(value ? async () => {
-          const latest = await this.commandState('setFanActive latest');
-          return this.modeProps(latest.workMode, latest);
-        } : { powerSwitch: 0 }, 'setFanActive', { powerSwitch: value ? 1 : 0 });
-        if (value && [MODE.AUTO, MODE.COOL, MODE.HEAT].includes(cur.workMode as 0 | 1 | 4)) {
-          this.lastMode = cur.workMode;
-        }
-      }
-    } catch (e) { throw this.hapError('setFanActive', e); }
-  }
   private async setFanModeIdentifier(identifier: number): Promise<void> {
     const mode = this.fanModeDefinitions().find((entry) => entry.id === identifier);
     if (!mode) throw this.hapError('setFanModeIdentifier', new Error(`Unknown fan mode identifier: ${identifier}`));
@@ -407,7 +393,6 @@ export class TclAirConditioner {
       C.CurrentHeatingCoolingState.OFF);
     this.thermostat.updateCharacteristic(C.TargetHeatingCoolingState,
       reconciled.powerSwitch ? this.workModeToHk(reconciled.workMode) : C.TargetHeatingCoolingState.OFF);
-    this.fanSvc.updateCharacteristic(C.On, !!reconciled.powerSwitch);
     this.fanSelector.updateCharacteristic(
       C.ActiveIdentifier,
       this.windToIdentifier(reconciled.powerSwitch
